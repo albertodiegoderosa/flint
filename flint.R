@@ -201,7 +201,7 @@ run_flex <- function(y, XZ, family = c("poisson","gaussian","nbinom"),
   mcmc   <- buildMCMC(conf)
   cmodel <- compileNimble(model)
   cmcmc  <- compileNimble(mcmc, project=model)
-
+#
   tm <- system.time({
     samps <- runMCMC(cmcmc, niter=niter, nburnin=nburn, thin=thin,
                      nchains=nchains, samplesAsCodaMCMC=TRUE)
