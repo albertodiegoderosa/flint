@@ -204,7 +204,7 @@ run_flex <- function(y, XZ, family = c("poisson","gaussian","nbinom"),
 
   tm <- system.time({
     samps <- runMCMC(cmcmc, niter=niter, nburnin=nburn, thin=thin,
-                     nchains=nchains, samplesAsCodaMCMC=TRUE, progressBar=FALSE)
+                     nchains=nchains, samplesAsCodaMCMC=TRUE)
   })
   S <- as.matrix(do.call(rbind, samps))
   list(samples = samps, Smat = S, time = unname(tm["elapsed"]),
