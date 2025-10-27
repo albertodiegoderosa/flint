@@ -78,152 +78,116 @@ code_flex <- function(N, P, Q, family = c("poisson","gaussian","nbinom"),
   prior  <- match.arg(prior)
   nimbleCode({
     for (i in 1:N) {
-      # signed-power mains
-      lin_main[i] <- 0
+      ## mains: signed-power contributions
       for (j in 1:P) {
         s[i,j] <- 2*step(xz[i,j]) - 1
         a[i,j] <- abs(xz[i,j]) + eps
-        fmain[i,j] <- beta[j] * s[i,j] * pow(a[i,j], gamma[j])
-        lin_main[i] <- lin_main[i] + fmain[i,j]
+        main_contrib[i,j] <- beta[j] * s[i,j] * pow(a[i,j], gamma[j])
       }
-      # interactions (all pairs)
-      lin_int[i] <- 0
+      if (P > 1) { lin_main[i] <- sum(main_contrib[i, 1:P]) } else { lin_main[i] <- main_contrib[i,1] }
+
+      ## pairwise interactions using constant index maps j1/j2 (passed in constants)
       for (m in 1:Q) {
-        j1[m] <- pair1[m]
-        j2[m] <- pair2[m]
         f1[i,m] <- s[i, j1[m]] * pow(a[i, j1[m]], psi1[m])
         f2[i,m] <- s[i, j2[m]] * pow(a[i, j2[m]], psi2[m])
-        # prior-specific multiplier on kappa:
-        # (switch): zeta[m] * kappa[m]
-        # (hs):     kappa[m]
         int_term[i,m] <- MULT[m] * kappa[m] * f1[i,m] * f2[i,m]
-        lin_int[i] <- lin_int[i] + int_term[i,m]
       }
-      # likelihood per family
-      if (FAM == 1) {          # Poisson
+      if (Q > 1) { lin_int[i] <- sum(int_term[i, 1:Q]) } else { lin_int[i] <- int_term[i,1] }
+
+      ## likelihood
+      if (FAM == 1) {
         log(mu[i]) <- alpha + lin_main[i] + lin_int[i]
-        y[i] ~ dpois(mu[i])
-        y_rep[i] ~ dpois(mu[i])
+        y[i] ~ dpois(mu[i]); y_rep[i] ~ dpois(mu[i])
       }
-      if (FAM == 2) {          # Gaussian
+      if (FAM == 2) {
         mu_g[i] <- alpha + lin_main[i] + lin_int[i]
-        y[i] ~ dnorm(mu_g[i], prec)
-        y_rep[i] ~ dnorm(mu_g[i], prec)
+        y[i] ~ dnorm(mu_g[i], prec); y_rep[i] ~ dnorm(mu_g[i], prec)
       }
-      if (FAM == 3) {          # NegBin (mean-parametrised)
+      if (FAM == 3) {
         log(mu_nb[i]) <- alpha + lin_main[i] + lin_int[i]
         y[i] ~ dnbinom(size=delta, prob = delta / (delta + mu_nb[i]))
         y_rep[i] ~ dnbinom(size=delta, prob = delta / (delta + mu_nb[i]))
       }
     }
-    # priors: mains & powers
+
+    ## priors
     alpha ~ dnorm(0, 1.0E-4)
-    for (j in 1:P) {
-      beta[j]  ~ dnorm(0, prec_beta)
-      gamma[j] ~ dunif(0.25, 3)
-    }
-    # priors: interactions
-    for (m in 1:Q) {
-      # learned powers per leg
-      psi1[m] ~ dunif(0.25, 3)
-      psi2[m] ~ dunif(0.25, 3)
-    }
-    # binary-switch or horseshoe block (filled at build time via constants/logical flags)
-    # switch: MULT[m] = zeta[m] with zeta[m] ~ dbern(pi_int)
-    # hs:     MULT[m] = 1 and kappa ~ N(0, tau2 * lambda2_m)
+    for (j in 1:P) { beta[j] ~ dnorm(0, prec_beta); gamma[j] ~ dunif(0.25, 3) }
+    for (m in 1:Q) { psi1[m] ~ dunif(0.25, 3); psi2[m] ~ dunif(0.25, 3) }
+
+    ## switch or horseshoe on kappa
     if (USE_SWITCH == 1) {
       for (m in 1:Q) {
-        zeta[m] ~ dbern(pi_int)
-        MULT[m] <- zeta[m]
+        zeta[m] ~ dbern(pi_int);  MULT[m] <- zeta[m]
         kappa[m] ~ dnorm(0, prec_kappa)
       }
-      pi_int ~ dbeta(1, 9)
-      prec_kappa ~ dgamma(0.5, 0.5)
+      pi_int ~ dbeta(1, 9);  prec_kappa ~ dgamma(0.5, 0.5)
     }
     if (USE_HS == 1) {
-      # global tau^2 ~ half-Cauchy via IG mixture
       tau2 ~ dinvgamma(0.5, 1 / xi);  xi ~ dinvgamma(0.5, 1)
       for (m in 1:Q) {
-        # local lambda_m^2 ~ half-Cauchy via IG mixture
-        lambda2[m] ~ dinvgamma(0.5, 1 / nu[m])
-        nu[m]      ~ dinvgamma(0.5, 1)
+        lambda2[m] ~ dinvgamma(0.5, 1 / nu[m]);  nu[m] ~ dinvgamma(0.5, 1)
         prec_kappa_m[m] <- 1 / (tau2 * lambda2[m])
         kappa[m] ~ dnorm(0, prec_kappa_m[m])
         MULT[m] <- 1
       }
     }
-    # hyper for mains
     prec_beta ~ dgamma(0.5, 0.5)
-    # Gaussian variance / NB size
     if (FAM == 2) prec ~ dgamma(1,1)
     if (FAM == 3) delta ~ dgamma(0.5,0.5)
 
-    # magnitude summary for interactions
     kappa_mag <- sum(pow(kappa[1:Q], 2))
   })
 }
+
+
 
 # --------------- generic fit wrapper -----------------------
 run_flex <- function(y, XZ, family = c("poisson","gaussian","nbinom"),
                      prior = c("switch","horseshoe"),
                      niter=6000, nburn=3000, thin=2, nchains=2) {
-  family <- match.arg(family)
-  prior  <- match.arg(prior)
+  family <- match.arg(family); prior <- match.arg(prior)
   fam_code <- switch(family, poisson=1L, gaussian=2L, nbinom=3L)
   N <- nrow(XZ); P <- ncol(XZ)
-  pairs <- build_pairs(P); Q <- length(pairs$pair1)
-  if (Q == 0) { pairs <- list(pair1 = 1L, pair2 = 1L); Q <- 1L } # harmless stub
+  pairs <- build_pairs(P); Q <- length(pairs$pair1)  # P>=2 in all our runs, so Q>=1
 
   code <- code_flex(N,P,Q,family,prior)
-
   consts <- list(N=N, P=P, Q=Q, eps=1e-6,
-                 pair1 = as.integer(pairs$pair1),
-                 pair2 = as.integer(pairs$pair2),
+                 j1 = as.integer(pairs$pair1),
+                 j2 = as.integer(pairs$pair2),
                  FAM = fam_code,
                  USE_SWITCH = as.integer(prior=="switch"),
                  USE_HS     = as.integer(prior=="horseshoe"))
   data <- list(y = y, xz = as.matrix(XZ))
 
-  # inits
   init_fun <- function() {
     ini <- list(alpha = 0,
                 beta  = rnorm(P,0,0.5),
                 gamma = runif(P,0.8,1.2),
                 psi1  = runif(Q,0.8,1.2),
-                psi2  = runif(Q,0.8,1.2))
+                psi2  = runif(Q,0.8,1.2),
+                prec_beta = 1)
     if (prior == "switch") {
-      ini$pi_int <- 0.15
-      ini$zeta   <- rbinom(Q,1,0.1)
-      ini$kappa  <- rnorm(Q,0,0.1)
-      ini$prec_kappa <- 1
+      ini$pi_int <- 0.15;  ini$zeta <- rbinom(Q,1,0.1)
+      ini$kappa <- rnorm(Q,0,0.1); ini$prec_kappa <- 1
     } else {
-      ini$tau2 <- 1; ini$xi <- 1
-      ini$lambda2 <- rep(1, Q); ini$nu <- rep(1, Q)
+      ini$tau2 <- 1; ini$xi <- 1; ini$lambda2 <- rep(1, Q); ini$nu <- rep(1, Q)
       ini$kappa <- rnorm(Q,0,0.1)
     }
-    ini$prec_beta <- 1
     if (family == "gaussian") ini$prec <- 1/var(y)
     if (family == "nbinom")   ini$delta <- 1
     ini
   }
 
   model <- nimbleModel(code, constants=consts, data=data, inits=init_fun())
-  monitors <- c("alpha",
-                paste0("beta[",1:P,"]"),
-                paste0("gamma[",1:P,"]"),
-                paste0("psi1[",1:Q,"]"),
-                paste0("psi2[",1:Q,"]"),
-                paste0("kappa[",1:Q,"]"),
-                "kappa_mag",
-                paste0("y_rep[",1:N,"]"))
-  if (prior == "switch") monitors <- c(monitors, "pi_int")
+  monitors <- c("alpha", paste0("beta[",1:P,"]"), paste0("gamma[",1:P,"]"),
+                paste0("psi1[",1:Q,"]"), paste0("psi2[",1:Q,"]"),
+                paste0("kappa[",1:Q,"]"), "kappa_mag", paste0("y_rep[",1:N,"]"))
+  if (prior == "switch")    monitors <- c(monitors, "pi_int")
   if (prior == "horseshoe") monitors <- c(monitors, "tau2")
 
   conf <- configureMCMC(model, monitors = monitors)
-  # slice for powers
-  for (nm in c(paste0("gamma[",1:P,"]"),
-               paste0("psi1[",1:Q,"]"),
-               paste0("psi2[",1:Q,"]"))) {
+  for (nm in c(paste0("gamma[",1:P,"]"), paste0("psi1[",1:Q,"]"), paste0("psi2[",1:Q,"]"))) {
     if (nm %in% model$getNodeNames()) { conf$removeSamplers(nm); conf$addSampler(nm, type="slice") }
   }
   mcmc   <- buildMCMC(conf)
@@ -239,35 +203,6 @@ run_flex <- function(y, XZ, family = c("poisson","gaussian","nbinom"),
        P=P, Q=Q, prior=prior, family=family)
 }
 
-report_fit <- function(name, y, fit) {
-  cat("\n--- ", name, " [", fit$prior, "] ---\n", sep="")
-  fam <- fit$family
-  S   <- fit$Smat
-  if (fam == "gaussian") {
-    ppc <- ppc_gaussian(S, y)
-  } else {
-    ppc <- ppc_count(S, y)
-  }
-  di  <- diag_summary(fit$samples)
-  cat(sprintf("Runtime (s): %.2f | Rhat_max: %.3f | ESS_min: %.0f | Heidel_pass: %.2f\n",
-              fit$time, di["Rhat_max"], di["ESS_min"], di["Heidel_pass"]))
-  if (fam == "gaussian") {
-    cat(sprintf("PPC: obs_mean=%.3f rep_mean=%.3f | obs_sd=%.3f rep_sd=%.3f | RMSE=%.3f MAE=%.3f\n",
-                ppc["obs_mean"], ppc["rep_mean"], ppc["obs_sd"], ppc["rep_sd"], ppc["RMSE"], ppc["MAE"]))
-  } else {
-    cat(sprintf("PPC: obs_mean=%.3f rep_mean=%.3f | obs_var=%.3f rep_var=%.3f | RMSE=%.3f MAE=%.3f\n",
-                ppc["obs_mean"], ppc["rep_mean"], ppc["obs_var"], ppc["rep_var"], ppc["RMSE"], ppc["MAE"]))
-  }
-  if ("kappa_mag" %in% colnames(S)) {
-    km <- S[,"kappa_mag"]
-    cat("||kappa||^2 ~ ", paste(round(summ_ci(km),3), collapse=" "), "\n", sep="")
-  }
-  tk <- top_kappa_table(S)
-  if (!is.null(tk)) {
-    cat("Top |kappa| (median [2.5%,97.5%]):\n")
-    print(tk, row.names=FALSE)
-  }
-}
 
 # ------------------- DATA PREPARATION ----------------------
 # Simulations
