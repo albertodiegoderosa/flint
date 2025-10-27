@@ -1,15 +1,17 @@
 # ===========================================================
-# flint_flex_compare.R
-# Flexible interactions with learned powers, comparing:
-#   (A) Binary switches (zeta)   vs   (B) Plain horseshoe on kappa
+# flint.R
+# Flexible interactions with learned powers — comparing:
+#  (A) binary switches (zeta) vs (B) horseshoe on kappa
 # Datasets: Sim A/B/C/D, ToothGrowth (Gaussian), warpbreaks (NegBin),
 #           PlantGrowth (Gaussian), InsectSprays (Poisson)
+# Notes:
+#  - Interactions use powered covariates: f(x) = sign(x)*|x|^power
+#  - No p-values; only PPCs, RMSE/MAE, Rhat, ESS, Heidelberger
 # ===========================================================
 suppressPackageStartupMessages({
   library(nimble)
   library(coda)
 })
-
 set.seed(123)
 
 # ------------------------- helpers -------------------------
@@ -38,12 +40,10 @@ ppc_count <- function(S, y, prefix="y_rep[") {
 }
 
 diag_summary <- function(mcmc_list) {
-  # R-hat (Gelman diag), min ESS, Heidel pass rate
   gd <- try(gelman.diag(mcmc_list, autoburnin = FALSE), silent=TRUE)
   rhat_max <- if (inherits(gd, "try-error")) NA_real_ else suppressWarnings(max(gd$psrf[,1], na.rm=TRUE))
   ess <- try(effectiveSize(mcmc_list), silent=TRUE)
   ess_min <- if (inherits(ess, "try-error")) NA_real_ else suppressWarnings(min(ess, na.rm=TRUE))
-  # Heidelberger–Welch stationarity: fraction passing across chains × params
   heidel_pass <- try({
     chsum <- lapply(mcmc_list, function(ch) {
       hd <- heidel.diag(ch)
@@ -72,13 +72,16 @@ top_kappa_table <- function(S, kappa_prefix="kappa[", top=6) {
 summ_ci <- function(x) c(mean=mean(x), lo=quantile(x,0.025), hi=quantile(x,0.975))
 
 # ----------------- nimbleCode generator --------------------
+# Interactions are products of powered covariates:
+#  int_term[i,m] = MULT[m] * kappa[m] * (sign(x_j1)*|x_j1|^psi1[m]) * (sign(x_j2)*|x_j2|^psi2[m])
+# j1/j2 are constant index maps (passed in via constants), so no node redefinitions.
 code_flex <- function(N, P, Q, family = c("poisson","gaussian","nbinom"),
                       prior = c("switch","horseshoe")) {
   family <- match.arg(family)
   prior  <- match.arg(prior)
   nimbleCode({
     for (i in 1:N) {
-      ## mains: signed-power contributions
+      # mains: signed-power contributions
       for (j in 1:P) {
         s[i,j] <- 2*step(xz[i,j]) - 1
         a[i,j] <- abs(xz[i,j]) + eps
@@ -86,7 +89,7 @@ code_flex <- function(N, P, Q, family = c("poisson","gaussian","nbinom"),
       }
       if (P > 1) { lin_main[i] <- sum(main_contrib[i, 1:P]) } else { lin_main[i] <- main_contrib[i,1] }
 
-      ## pairwise interactions using constant index maps j1/j2 (passed in constants)
+      # interactions (all pairs) using constant index maps j1/j2
       for (m in 1:Q) {
         f1[i,m] <- s[i, j1[m]] * pow(a[i, j1[m]], psi1[m])
         f2[i,m] <- s[i, j2[m]] * pow(a[i, j2[m]], psi2[m])
@@ -94,7 +97,7 @@ code_flex <- function(N, P, Q, family = c("poisson","gaussian","nbinom"),
       }
       if (Q > 1) { lin_int[i] <- sum(int_term[i, 1:Q]) } else { lin_int[i] <- int_term[i,1] }
 
-      ## likelihood
+      # likelihood per family
       if (FAM == 1) {
         log(mu[i]) <- alpha + lin_main[i] + lin_int[i]
         y[i] ~ dpois(mu[i]); y_rep[i] ~ dpois(mu[i])
@@ -110,12 +113,12 @@ code_flex <- function(N, P, Q, family = c("poisson","gaussian","nbinom"),
       }
     }
 
-    ## priors
+    # priors: mains & powers
     alpha ~ dnorm(0, 1.0E-4)
     for (j in 1:P) { beta[j] ~ dnorm(0, prec_beta); gamma[j] ~ dunif(0.25, 3) }
     for (m in 1:Q) { psi1[m] ~ dunif(0.25, 3); psi2[m] ~ dunif(0.25, 3) }
 
-    ## switch or horseshoe on kappa
+    # switch or horseshoe on kappa
     if (USE_SWITCH == 1) {
       for (m in 1:Q) {
         zeta[m] ~ dbern(pi_int);  MULT[m] <- zeta[m]
@@ -136,11 +139,10 @@ code_flex <- function(N, P, Q, family = c("poisson","gaussian","nbinom"),
     if (FAM == 2) prec ~ dgamma(1,1)
     if (FAM == 3) delta ~ dgamma(0.5,0.5)
 
+    # overall interaction magnitude
     kappa_mag <- sum(pow(kappa[1:Q], 2))
   })
 }
-
-
 
 # --------------- generic fit wrapper -----------------------
 run_flex <- function(y, XZ, family = c("poisson","gaussian","nbinom"),
@@ -149,7 +151,7 @@ run_flex <- function(y, XZ, family = c("poisson","gaussian","nbinom"),
   family <- match.arg(family); prior <- match.arg(prior)
   fam_code <- switch(family, poisson=1L, gaussian=2L, nbinom=3L)
   N <- nrow(XZ); P <- ncol(XZ)
-  pairs <- build_pairs(P); Q <- length(pairs$pair1)  # P>=2 in all our runs, so Q>=1
+  pairs <- build_pairs(P); Q <- length(pairs$pair1)  # P>=2 here, so Q>=1
 
   code <- code_flex(N,P,Q,family,prior)
   consts <- list(N=N, P=P, Q=Q, eps=1e-6,
@@ -180,13 +182,19 @@ run_flex <- function(y, XZ, family = c("poisson","gaussian","nbinom"),
   }
 
   model <- nimbleModel(code, constants=consts, data=data, inits=init_fun())
-  monitors <- c("alpha", paste0("beta[",1:P,"]"), paste0("gamma[",1:P,"]"),
-                paste0("psi1[",1:Q,"]"), paste0("psi2[",1:Q,"]"),
-                paste0("kappa[",1:Q,"]"), "kappa_mag", paste0("y_rep[",1:N,"]"))
+  monitors <- c("alpha",
+                paste0("beta[",1:P,"]"),
+                paste0("gamma[",1:P,"]"),
+                paste0("psi1[",1:Q,"]"),
+                paste0("psi2[",1:Q,"]"),
+                paste0("kappa[",1:Q,"]"),
+                "kappa_mag",
+                paste0("y_rep[",1:N,"]"))
   if (prior == "switch")    monitors <- c(monitors, "pi_int")
   if (prior == "horseshoe") monitors <- c(monitors, "tau2")
 
   conf <- configureMCMC(model, monitors = monitors)
+  # slice sampling for power parameters
   for (nm in c(paste0("gamma[",1:P,"]"), paste0("psi1[",1:Q,"]"), paste0("psi2[",1:Q,"]"))) {
     if (nm %in% model$getNodeNames()) { conf$removeSamplers(nm); conf$addSampler(nm, type="slice") }
   }
@@ -203,6 +211,25 @@ run_flex <- function(y, XZ, family = c("poisson","gaussian","nbinom"),
        P=P, Q=Q, prior=prior, family=family)
 }
 
+report_fit <- function(name, y, fit) {
+  cat("\n--- ", name, " [", fit$prior, "] ---\n", sep="")
+  fam <- fit$family; S <- fit$Smat
+  ppc <- if (fam == "gaussian") ppc_gaussian(S, y) else ppc_count(S, y)
+  di  <- diag_summary(fit$samples)
+  cat(sprintf("Runtime (s): %.2f | Rhat_max: %.3f | ESS_min: %.0f | Heidel_pass: %.2f\n",
+              fit$time, di["Rhat_max"], di["ESS_min"], di["Heidel_pass"]))
+  if (fam == "gaussian") {
+    cat(sprintf("PPC: obs_mean=%.3f rep_mean=%.3f | obs_sd=%.3f rep_sd=%.3f | RMSE=%.3f MAE=%.3f\n",
+                ppc["obs_mean"], ppc["rep_mean"], ppc["obs_sd"], ppc["rep_sd"], ppc["RMSE"], ppc["MAE"]))
+  } else {
+    cat(sprintf("PPC: obs_mean=%.3f rep_mean=%.3f | obs_var=%.3f rep_var=%.3f | RMSE=%.3f MAE=%.3f\n",
+                ppc["obs_mean"], ppc["rep_mean"], ppc["obs_var"], ppc["rep_var"], ppc["RMSE"], ppc["MAE"]))
+  }
+  if ("kappa_mag" %in% colnames(S)) {
+    km <- S[,"kappa_mag"]; cat("||kappa||^2 ~ ", paste(round(summ_ci(km),3), collapse=" "), "\n", sep="")
+  }
+  tk <- top_kappa_table(S); if (!is.null(tk)) { cat("Top |kappa| (median [2.5%,97.5%]):\n"); print(tk, row.names=FALSE) }
+}
 
 # ------------------- DATA PREPARATION ----------------------
 # Simulations
@@ -245,9 +272,8 @@ y_C <- rpois(N5, exp(eta_C))
 ND <- 650
 x1 <- rnorm(ND, 0.2, 1.0); x2 <- rnorm(ND, -0.5, 1.0); x3 <- rnorm(ND, 0.0, 1.0)
 XZ_D <- cbind(zscore(x1), zscore(x2), zscore(x3))
-F <- factor(sample(c("A","B"), ND, replace=TRUE))
-F_sign <- ifelse(F=="A", 1, -1)
-XZ_D <- cbind(XZ_D, zscore(F_sign))  # treat as a fourth predictor
+F <- factor(sample(c("A","B"), ND, replace=TRUE)); F_sign <- ifelse(F=="A", 1, -1)
+XZ_D <- cbind(XZ_D, zscore(F_sign))  # treat as fourth predictor
 alpha_D <- 0.7; beta_D <- c(0.7,-0.6,0.4, 0.3); gamma_D <- c(1.0,1.5,0.7,1.0)
 kappa12 <- 0.4; phi_F3 <- 0.5; psi_F3 <- 1.2
 eta_D <- alpha_D +
@@ -295,7 +321,6 @@ run_both <- function(name, y, XZ, family) {
   report_fit(name, y, fit_sw)
   fit_hs <- run_flex(y, XZ, family=family, prior="horseshoe")
   report_fit(name, y, fit_hs)
-
   invisible(list(switch=fit_sw, horseshoe=fit_hs))
 }
 
@@ -315,9 +340,9 @@ resIS <- run_both("InsectSprays (Poisson; spray)",        y_IS, XZ_IS, "poisson"
 cat("\n--- Greek mapping (ASCII) ---\n")
 cat("alpha = intercept\n",
     "beta[j] = main coefficient for predictor j\n",
-    "gamma[j] = learned power for predictor j in main term\n",
-    "kappa[m] = interaction coefficient for pair m = (pair1[m], pair2[m])\n",
-    "psi1[m], psi2[m] = learned powers applied to the two legs of pair m\n",
+    "gamma[j] = learned power for predictor j (main term)\n",
+    "kappa[m] = interaction coefficient for pair m = (j1[m], j2[m])\n",
+    "psi1[m], psi2[m] = learned powers for the two legs of pair m\n",
     "zeta[m] = binary switch for interaction m (switch model only)\n",
-    "tau2, lambda2[m] = horseshoe global/local scales (horseshoe model only)\n",
+    "tau2, lambda2[m] = horseshoe global/local scales (horseshoe only)\n",
     "prec (Gaussian) = residual precision; delta (NegBin) = size parameter\n", sep="")
