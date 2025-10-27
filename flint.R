@@ -143,7 +143,7 @@ code_flex <- function(N, P, Q, family = c("poisson","gaussian","nbinom"),
     kappa_mag <- sum(pow(kappa[1:Q], 2))
   })
 }
-
+#
 # --------------- generic fit wrapper -----------------------
 run_flex <- function(y, XZ, family = c("poisson","gaussian","nbinom"),
                      prior = c("switch","horseshoe"),
