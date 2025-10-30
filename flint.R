@@ -147,7 +147,7 @@ code_flex <- function(N, P, Q, family = c("poisson","gaussian","nbinom"),
 # --------------- generic fit wrapper -----------------------
 run_flex <- function(y, XZ, family = c("poisson","gaussian","nbinom"),
                      prior = c("switch","horseshoe"),
-                     niter=6000, nburn=3000, thin=2, nchains=2) {
+                     niter=4e5, nburn=2e5, thin=10, nchains=3) {
   family <- match.arg(family); prior <- match.arg(prior)
   fam_code <- switch(family, poisson=1L, gaussian=2L, nbinom=3L)
   N <- nrow(XZ); P <- ncol(XZ)
@@ -326,15 +326,26 @@ run_both <- function(name, y, XZ, family) {
 
 cat("=== SIMULATIONS ===\n")
 resA <- run_both("Sim A (Poisson, 3 vars, no interaction)", y_A, XZ3, "poisson")
+save.image("flint.Rdata",version=2)
 resB <- run_both("Sim B (Poisson, 3 vars, x1:x2)",           y_B, XZ3, "poisson")
+save.image("flint.Rdata",version=2)
 resC <- run_both("Sim C (Poisson, 5 vars, powers 1/3 & 3, 3 ints)", y_C, XZ5, "poisson")
+save.image("flint.Rdata",version=2)
 resD <- run_both("Sim D (Poisson, x1,x2,x3 + factor)",        y_D, XZ_D, "poisson")
+save.image("flint.Rdata",version=2)
 
 cat("\n=== BUILT-INS ===\n")
 resTG <- run_both("ToothGrowth (Gaussian; dose × supp)",  y_TG, XZ_TG, "gaussian")
+save.image("flint.Rdata",version=2)
+
 resWB <- run_both("warpbreaks (NegBin; wool × tension)",  y_WB, XZ_WB, "nbinom")
+save.image("flint.Rdata",version=2)
+
 resPG <- run_both("PlantGrowth (Gaussian; groups)",       y_PG, XZ_PG, "gaussian")
+save.image("flint.Rdata",version=2)
+
 resIS <- run_both("InsectSprays (Poisson; spray)",        y_IS, XZ_IS, "poisson")
+save.image("flint.Rdata",version=2)
 
 # ---------------- Greek mapping (ASCII) --------------------
 cat("\n--- Greek mapping (ASCII) ---\n")
@@ -346,3 +357,4 @@ cat("alpha = intercept\n",
     "zeta[m] = binary switch for interaction m (switch model only)\n",
     "tau2, lambda2[m] = horseshoe global/local scales (horseshoe only)\n",
     "prec (Gaussian) = residual precision; delta (NegBin) = size parameter\n", sep="")
+save.image("flint.Rdata",version=2)
