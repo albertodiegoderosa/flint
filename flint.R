@@ -1,20 +1,17 @@
 #!/usr/bin/env Rscript
 # ===========================================================
-# flint_batch_psis.R  (NO K-FOLD IN THIS FILE)
-# - Pairs + Triplets; flexible powers on mains & interactions
+# flint_batch_psis_pairs.R  (PAIRWISE ONLY, NO K-FOLD HERE)
+# - Flexible powers on mains & pairwise interactions
 # - Datasets: Sims, Built-ins, NY Tick, GBIF×WorldClim
 # - Priors:   horseshoe, switch
 # - Samplers: RW, slice, ESS, NUTS (if nimbleHMC present)
 # - Powers bounded: Uniform(-3, 3)
-# - Saves frequent checkpoints to flint.Rdata
-# - Outputs:
-#     results/<dataset>.csv         (runtime, diag, PPC, LOO)
-#     results/_summary_all.csv      (stacked)
-#     results/_collinearity_info/<dataset>.txt
-#     results/pareto_k_<dataset>_<prior>_<sampler>.csv
+# - Computes pointwise log-lik inside model → PSIS-LOO
+# - Saves frequent checkpoints to flintplus.Rdata
 # ===========================================================
 suppressPackageStartupMessages({
   library(nimble)
+  library(nimbleHMC)
   library(coda)
   library(terra)
   library(dplyr)
@@ -23,7 +20,7 @@ suppressPackageStartupMessages({
   library(readr)
   library(purrr)
   library(tibble)
-  library(loo)    # PSIS-LOO
+  library(loo)
 })
 
 set.seed(123)
@@ -32,20 +29,17 @@ set.seed(123)
 do_save <- TRUE
 save_point <- function(tag = NULL) {
   if (!do_save) return(invisible(NULL))
-  try(save.image("flint.Rdata", version = 2), silent = TRUE)
-  if (!is.null(tag)) message(sprintf(" [save_point: %s -> flint.Rdata]", tag))
+  try(save.image("flintplus.Rdata", version = 2), silent = TRUE)
+  if (!is.null(tag)) message(sprintf(" [save_point: %s -> flintplus.Rdata]", tag))
 }
 
 # ---------------------- CONFIG -----------------------------
 cfg <- list(
-  include_pairs    = TRUE,
-  include_triplets = TRUE,
-
   priors_to_run      = c("horseshoe","switch"),
   sampler_strategies = c("rw","slice","ess","nuts"),
 
-  # MCMC knobs (increase later for long runs)
-  niter = 3e5, nburn = 2e5, thin = 5, nchains = 3,
+  # MCMC knobs (bump later for long runs)
+  niter = 5e5, nburn = 3e5, thin = 5, nchains = 3,
 
   # GBIF×WorldClim aggregation
   gbif_csv   = "data/gbif_occ/bradypus_variegatus_gbif.csv",
@@ -69,33 +63,36 @@ tagify <- function(s) gsub("^_+|_+$","", gsub("[^A-Za-z0-9]+","_", s))
 ppc_gaussian <- function(S, y, prefix="y_rep[") {
   yc <- S[, startsWith(colnames(S), prefix), drop=FALSE]
   yhat <- colMeans(yc)
-  c(obs_mean = mean(y), rep_mean = mean(yhat),
-    obs_sd = sd(y),  rep_sd = sqrt(mean(apply(yc,2,var))),
-    RMSE = sqrt(mean((y - yhat)^2)), MAE = mean(abs(y - yhat)))
+  c(
+    obs_mean = mean(y), rep_mean = mean(yhat),
+    obs_sd = sd(y),     rep_sd  = sqrt(mean(apply(yc,2,var))),
+    RMSE = sqrt(mean((y - yhat)^2)),
+    MAE  = mean(abs(y - yhat))
+  )
 }
 ppc_count <- function(S, y, prefix="y_rep[") {
   yc <- S[, startsWith(colnames(S), prefix), drop=FALSE]
   yhat <- colMeans(yc)
-  c(obs_mean = mean(y), rep_mean = mean(yhat),
-    obs_var = var(y),  rep_var = mean(apply(yc,2,var))),
-    RMSE = sqrt(mean((y - yhat)^2)), MAE = mean(abs(y - yhat)))
+  c(
+    obs_mean = mean(y), rep_mean = mean(yhat),
+    obs_var  = var(y),  rep_var  = mean(apply(yc,2,var)),
+    RMSE = sqrt(mean((y - yhat)^2)),
+    MAE  = mean(abs(y - yhat))
+  )
 }
 
 diag_summary <- function(mcmc_list) {
-  # Rhat
   gd <- try(gelman.diag(mcmc_list, autoburnin = FALSE), silent = TRUE)
   rhat_max <- if (inherits(gd, "try-error")) NA_real_ else {
     ps <- gd$psrf
     col <- if (!is.null(colnames(ps)) && "Point est." %in% colnames(ps)) "Point est." else 1
     suppressWarnings(max(ps[, col], na.rm = TRUE))
   }
-  # ESS (min)
   ess <- try(effectiveSize(mcmc_list), silent = TRUE)
   ess_min <- if (inherits(ess, "try-error")) NA_real_ else suppressWarnings(min(ess, na.rm = TRUE))
-  # Heidelberger–Welch (aggregate across chains)
   hw <- try({
     per_chain <- lapply(mcmc_list, function(ch) {
-      hd <- heidel.diag(ch)  # matrix with cols: "stest","start","pvalue","htest",...
+      hd <- heidel.diag(ch)
       cols <- colnames(hd)
       stest_ok <- if ("stest" %in% cols) mean(hd[, "stest"] == 1, na.rm = TRUE) else NA_real_
       htest_ok <- if ("htest" %in% cols) mean(hd[, "htest"] == 1, na.rm = TRUE) else NA_real_
@@ -109,25 +106,16 @@ diag_summary <- function(mcmc_list) {
       Heidel_start_median  = median(mat[, "start_med"],  na.rm = TRUE),
       Heidel_pvalue_median = median(mat[, "pvalue_med"], na.rm = TRUE))
   }, silent = TRUE)
-
   if (inherits(hw, "try-error")) {
     c(Rhat_max = rhat_max, ESS_min = ess_min,
       Heidel_stable_frac = NA_real_, Heidel_halfwidth_frac = NA_real_,
       Heidel_start_median = NA_real_, Heidel_pvalue_median = NA_real_)
-  } else {
-    c(Rhat_max = rhat_max, ESS_min = ess_min, hw)
-  }
+  } else c(Rhat_max = rhat_max, ESS_min = ess_min, hw)
 }
-
-summ_ci <- function(x) c(mean=mean(x), lo=quantile(x,0.025), hi=quantile(x,0.975))
 
 build_pairs <- function(P) {
   if (P < 2) return(list(p1 = integer(0), p2 = integer(0)))
   cmb <- combn(P, 2); list(p1 = as.integer(cmb[1, ]), p2 = as.integer(cmb[2, ]))
-}
-build_triplets <- function(P) {
-  if (P < 3) return(list(t1 = integer(0), t2 = integer(0), t3 = integer(0)))
-  cmb <- combn(P, 3); list(t1 = as.integer(cmb[1, ]), t2 = as.integer(cmb[2, ]), t3 = as.integer(cmb[3, ]))
 }
 
 # ---------- COLLINEARITY (info only; no dropping) ----------
@@ -162,65 +150,68 @@ collin_report <- function(name, X, path_txt) {
 }
 
 # ----------------- SAMPLER ASSIGNMENT ----------------------
-assign_samplers <- function(conf, model, P, Q, R, strategy = c("auto","slice","rw","ess","nuts")) {
+assign_samplers <- function(conf, model, P, Q,
+                            strategy = c("auto","slice","rw","ess","nuts"),
+                            monitors = NULL) {
   strategy <- match.arg(strategy)
   betas   <- paste0("beta[",  1:P, "]")
   gammas  <- paste0("gamma[", 1:P, "]")
   psi1s   <- if (Q>0) paste0("psi1[",  1:Q, "]") else character()
   psi2s   <- if (Q>0) paste0("psi2[",  1:Q, "]") else character()
   kappas  <- if (Q>0) paste0("kappa[", 1:Q, "]") else character()
-  phi1s   <- if (R>0) paste0("phi1[",   1:R, "]") else character()
-  phi2s   <- if (R>0) paste0("phi2[",   1:R, "]") else character()
-  phi3s   <- if (R>0) paste0("phi3[",   1:R, "]") else character()
-  omegas  <- if (R>0) paste0("omega[",  1:R, "]") else character()
 
   rm_add <- function(nodes, type) {
     nodes <- nodes[nodes %in% model$getNodeNames()]
     if (!length(nodes)) return()
-    for (nm in nodes) { conf$removeSamplers(nm); conf$addSampler(nm, type = type) }
+    for (nm in nodes) {
+      conf$removeSamplers(nm)
+      conf$addSampler(target = nm, type = type, control = list())  # explicit target + control
+    }
   }
 
-  if (strategy %in% c("auto","slice")) {
-    rm_add(c(betas, gammas, psi1s, psi2s, kappas, phi1s, phi2s, phi3s, omegas), "slice")
-    return(invisible(conf))
-  }
-  if (strategy == "rw") {
-    rm_add(c(betas, gammas, psi1s, psi2s, kappas, phi1s, phi2s, phi3s, omegas), "RW")
-    return(invisible(conf))
-  }
+  if (strategy %in% c("auto","slice")) { rm_add(c(betas, gammas, psi1s, psi2s, kappas), "slice"); return(conf) }
+  if (strategy == "rw")                { rm_add(c(betas, gammas, psi1s, psi2s, kappas), "RW");    return(conf) }
   if (strategy == "ess") {
-    rm_add(betas,  "ess")
-    rm_add(c(kappas, omegas), "ess")
-    rm_add(c(gammas, psi1s, psi2s, phi1s, phi2s, phi3s), "slice")
-    return(invisible(conf))
+    rm_add(betas, "ess"); rm_add(kappas, "ess")
+    rm_add(c(gammas, psi1s, psi2s), "slice")
+    return(conf)
   }
+
+  # ---- NUTS / HMC ----
   if (strategy == "nuts") {
     if (!requireNamespace("nimbleHMC", quietly = TRUE)) {
       message("nimbleHMC not installed; using slice for 'nuts'.")
-      rm_add(c(betas, gammas, psi1s, psi2s, kappas, phi1s, phi2s, phi3s, omegas), "slice")
-      return(invisible(conf))
+      rm_add(c(betas, gammas, psi1s, psi2s, kappas), "slice")
+      return(conf)
     }
-    ok <- FALSE
+    # Prefer configureHMC() which builds a NEW config (keeps monitors if we pass them)
+    if ("configureHMC" %in% getNamespaceExports("nimbleHMC")) {
+      conf_hmc <- nimbleHMC::configureHMC(model, type = "NUTS",
+                                          monitors = monitors, print = FALSE)
+      return(conf_hmc)
+    }
+    # Fallback: retrofit an existing conf (requires replace=TRUE)
     if ("addHMC" %in% getNamespaceExports("nimbleHMC")) {
-      suppressMessages(nimbleHMC::addHMC(conf, type = "NUTS")); ok <- TRUE
-    } else if ("configureHMC" %in% getNamespaceExports("nimbleHMC")) {
-      suppressMessages(nimbleHMC::configureHMC(conf, type = "NUTS")); ok <- TRUE
+      nimbleHMC::addHMC(conf, type = "NUTS", replace = TRUE)
+      return(conf)
     }
-    if (!ok) {
-      message("nimbleHMC present but HMC config not found; using slice.")
-      rm_add(c(betas, gammas, psi1s, psi2s, kappas, phi1s, phi2s, phi3s, omegas), "slice")
-    }
-    return(invisible(conf))
+    message("nimbleHMC present but no usable HMC config fn; using slice.")
+    rm_add(c(betas, gammas, psi1s, psi2s, kappas), "slice")
+    return(conf)
   }
+
+  return(conf)
 }
 
-# -------- nimbleCode generator (pairs + triplets + ll[i]) ---
-code_flex_QRaware <- function(N, P, Q, R, family = c("poisson","gaussian","nbinom"),
-                              prior  = c("switch","horseshoe"),
-                              include_pairs = TRUE, include_triplets = TRUE) {
-  family <- match.arg(family); prior <- match.arg(prior)
 
-  main_block <- quote({
+# -------- nimbleCode generator (pairs + ll[i]) --------------
+code_pairs_Qaware <- function(N, P, Q, FAM = c(1,2,3), prior = c("switch","horseshoe")) {
+  prior <- match.arg(prior)
+  FAM <- match.arg(as.character(FAM), choices = c("1","2","3"))
+  FAM <- as.integer(FAM)
+
+  nimbleCode({
+    # mains
     for (i in 1:N) {
       for (j in 1:P) {
         s[i,j] <- 2*step(xz[i,j]) - 1
@@ -229,18 +220,9 @@ code_flex_QRaware <- function(N, P, Q, R, family = c("poisson","gaussian","nbino
       }
       if (P > 1) { lin_main[i] <- sum(main_contrib[i,1:P]) } else { lin_main[i] <- main_contrib[i,1] }
     }
-  })
 
-  pair_block <-
-    if (!include_pairs || Q == 0L) quote({ for (i in 1:N) lin_pairs[i] <- 0 }) else
-    if (Q == 1L) quote({
-      for (i in 1:N) {
-        f1p[i,1] <- s[i, j1] * pow(a[i, j1], psi1[1])
-        f2p[i,1] <- s[i, j2] * pow(a[i, j2], psi2[1])
-        int_pair[i,1] <- MULT2[1] * kappa[1] * f1p[i,1] * f2p[i,1]
-        lin_pairs[i] <- int_pair[i,1]
-      }
-    }) else quote({
+    # pairs
+    if (Q > 0) {
       for (i in 1:N) {
         for (m in 1:Q) {
           f1p[i,m] <- s[i, j1[m]] * pow(a[i, j1[m]], psi1[m])
@@ -249,86 +231,54 @@ code_flex_QRaware <- function(N, P, Q, R, family = c("poisson","gaussian","nbino
         }
         lin_pairs[i] <- sum(int_pair[i,1:Q])
       }
-    })
+    } else {
+      for (i in 1:N) lin_pairs[i] <- 0
+    }
 
-  trip_block <-
-    if (!include_triplets || R == 0L) quote({ for (i in 1:N) lin_trip[i] <- 0 }) else
-    if (R == 1L) quote({
+    # likelihood + pointwise log-lik
+    if (FAM == 1) {  # Poisson
       for (i in 1:N) {
-        g1[i,1] <- s[i, k1] * pow(a[i, k1],   phi1[1])
-        g2[i,1] <- s[i, k2] * pow(a[i, k2],   phi2[1])
-        g3[i,1] <- s[i, k3] * pow(a[i, k3],   phi3[1])
-        int_trip[i,1] <- MULT3[1] * omega[1] * g1[i,1] * g2[i,1] * g3[i,1]
-        lin_trip[i] <- int_trip[i,1]
+        log(mu[i]) <- alpha + lin_main[i] + lin_pairs[i]
+        y[i] ~ dpois(mu[i]); y_rep[i] ~ dpois(mu[i])
+        ll[i] <- dpois(y[i], mu[i], log=1)
       }
-    }) else quote({
+    }
+    if (FAM == 2) {  # Gaussian
       for (i in 1:N) {
-        for (r in 1:R) {
-          g1[i,r] <- s[i, k1[r]] * pow(a[i, k1[r]], phi1[r])
-          g2[i,r] <- s[i, k2[r]] * pow(a[i, k2[r]], phi2[r])
-          g3[i,r] <- s[i, k3[r]] * pow(a[i, k3[r]], phi3[r])
-          int_trip[i,r] <- MULT3[r] * omega[r] * g1[i,r] * g2[i,r] * g3[i,r]
-        }
-        lin_trip[i] <- sum(int_trip[i,1:R])
-      }
-    })
-
-  like_block <- switch(family,
-    poisson = quote({
-      for (i in 1:N) {
-        log(mu[i]) <- alpha + lin_main[i] + lin_pairs[i] + lin_trip[i]
-        y[i] ~ dpois(mu[i])
-        y_rep[i] ~ dpois(mu[i])
-        ll[i] <- dpois(y[i], mu[i], log=1)     # pointwise log-lik
-      }
-    }),
-    gaussian = quote({
-      for (i in 1:N) {
-        mu_g[i] <- alpha + lin_main[i] + lin_pairs[i] + lin_trip[i]
-        y[i] ~ dnorm(mu_g[i], prec)
-        y_rep[i] ~ dnorm(mu_g[i], prec)
-        ll[i] <- dnorm(y[i], mean=mu_g[i], prec=prec, log=1)  # pointwise log-lik
+        mu_g[i] <- alpha + lin_main[i] + lin_pairs[i]
+        y[i] ~ dnorm(mu_g[i], prec); y_rep[i] ~ dnorm(mu_g[i], prec)
+        ll[i] <- dnorm(y[i], mean=mu_g[i], prec=prec, log=1)
       }
       prec ~ dgamma(1,1)
-    }),
-    nbinom = quote({
+    }
+    if (FAM == 3) {  # NegBin
       for (i in 1:N) {
-        log(mu_nb[i]) <- alpha + lin_main[i] + lin_pairs[i] + lin_trip[i]
+        log(mu_nb[i]) <- alpha + lin_main[i] + lin_pairs[i]
         y[i] ~ dnbinom(size=delta, prob = delta / (delta + mu_nb[i]))
         y_rep[i] ~ dnbinom(size=delta, prob = delta / (delta + mu_nb[i]))
-        ll[i] <- dnbinom(y[i], size=delta, prob = delta / (delta + mu_nb[i]), log=1) # pointwise log-lik
+        ll[i] <- dnbinom(y[i], size=delta, prob = delta / (delta + mu_nb[i]), log=1)
       }
       delta ~ dgamma(0.5,0.5)
-    })
-  )
+    }
 
-  prior_block <- if (prior == "switch") {
-    quote({
-      alpha ~ dnorm(0, 1.0E-4)
-      for (j in 1:P) { beta[j] ~ dnorm(0, prec_beta); gamma[j] ~ dunif(-3, 3) }
-      prec_beta ~ dgamma(0.5, 0.5)
+    # priors (use compile-time flags!)
+    alpha ~ dnorm(0, 1.0E-4)
+    for (j in 1:P) { beta[j] ~ dnorm(0, prec_beta); gamma[j] ~ dunif(-3, 3) }
+    prec_beta ~ dgamma(0.5, 0.5)
+
+    if (USE_SWITCH == 1) {
       if (Q > 0) {
         for (m in 1:Q) {
           psi1[m] ~ dunif(-3, 3); psi2[m] ~ dunif(-3, 3)
-          zeta2[m] ~ dbern(pi2); MULT2[m] <- zeta2[m]; kappa[m] ~ dnorm(0, prec_kappa2)
+          zeta2[m] ~ dbern(pi2); MULT2[m] <- zeta2[m]
+          kappa[m] ~ dnorm(0, prec_kappa2)
         }
         pi2 ~ dbeta(1,9); prec_kappa2 ~ dgamma(0.5,0.5)
-      }
-      if (R > 0) {
-        for (r in 1:R) {
-          phi1[r] ~ dunif(-3, 3); phi2[r] ~ dunif(-3, 3); phi3[r] ~ dunif(-3, 3)
-          zeta3[r] ~ dbern(pi3); MULT3[r] <- zeta3[r]; omega[r] ~ dnorm(0, prec_kappa3)
-        }
-        pi3 ~ dbeta(1,9); prec_kappa3 ~ dgamma(0.5,0.5)
-      }
-      kappa_mag2 <- ifelse(Q>0, sum(pow(kappa[1:Q],2)), 0)
-      omega_mag2 <- ifelse(R>0, sum(pow(omega[1:R],2)), 0)
-    })
-  } else {
-    quote({
-      alpha ~ dnorm(0, 1.0E-4)
-      for (j in 1:P) { beta[j] ~ dnorm(0, prec_beta); gamma[j] ~ dunif(-3, 3) }
-      prec_beta ~ dgamma(0.5, 0.5)
+        kappa_mag2 <- sum(pow(kappa[1:Q],2))
+      } else kappa_mag2 <- 0
+    }
+
+    if (USE_HS == 1) {
       if (Q > 0) {
         tau2_k ~ dinvgamma(0.5, 1 / xi_k);  xi_k ~ dinvgamma(0.5, 1)
         for (m in 1:Q) {
@@ -337,48 +287,31 @@ code_flex_QRaware <- function(N, P, Q, R, family = c("poisson","gaussian","nbino
           kappa[m] ~ dnorm(0, prec_kappa_m[m]); MULT2[m] <- 1
           psi1[m] ~ dunif(-3, 3); psi2[m] ~ dunif(-3, 3)
         }
-      } else { tau2_k <- 1 }
-      if (R > 0) {
-        tau2_o ~ dinvgamma(0.5, 1 / xi_o);  xi_o ~ dinvgamma(0.5, 1)
-        for (r in 1:R) {
-          lambda2_o[r] ~ dinvgamma(0.5, 1 / nu_o[r]);  nu_o[r] ~ dinvgamma(0.5, 1)
-          prec_omega_r[r] <- 1 / (tau2_o * lambda2_o[r])
-          omega[r] ~ dnorm(0, prec_omega_r[r]); MULT3[r] <- 1
-          phi1[r] ~ dunif(-3, 3); phi2[r] ~ dunif(-3, 3); phi3[r] ~ dunif(-3, 3)
-        }
-      } else { tau2_o <- 1 }
-      kappa_mag2 <- ifelse(Q>0, sum(pow(kappa[1:Q],2)), 0)
-      omega_mag2 <- ifelse(R>0, sum(pow(omega[1:R],2)), 0)
-    })
-  }
-
-  nimbleCode({ eval(main_block); eval(pair_block); eval(trip_block); eval(like_block); eval(prior_block) })
+        kappa_mag2 <- sum(pow(kappa[1:Q],2))
+      } else { tau2_k <- 1; kappa_mag2 <- 0 }
+    }
+  })
 }
+
 
 # --------------- LOG-LIK EXTRACTOR FOR LOO -----------------
 extract_loglik <- function(mcmc_list) {
-  # returns list(log_lik = S x N matrix, chain_id = vector length S)
-  loglik_chain <- list()
-  chain_id <- integer(0)
+  loglik_chain <- list(); chain_id <- integer(0)
   for (ch in seq_along(mcmc_list)) {
     M <- as.matrix(mcmc_list[[ch]])
     keep <- grepl("^ll\\[[0-9]+\\]$", colnames(M))
     if (!any(keep)) stop("No ll[i] columns found in MCMC output.")
     Mll <- M[, keep, drop=FALSE]
-    # sort columns by numeric index
     idx <- as.integer(gsub("^ll\\[|\\]$", "", colnames(Mll)))
-    ord <- order(idx)
-    Mll <- Mll[, ord, drop=FALSE]
+    Mll <- Mll[, order(idx), drop=FALSE]
     loglik_chain[[ch]] <- Mll
     chain_id <- c(chain_id, rep(ch, nrow(Mll)))
   }
-  log_lik <- do.call(rbind, loglik_chain)
-  list(log_lik = log_lik, chain_id = chain_id)
+  list(log_lik = do.call(rbind, loglik_chain), chain_id = chain_id)
 }
 
 compute_psis_loo <- function(mcmc_list) {
   ex <- extract_loglik(mcmc_list)
-  # relative eff wrt independent draws
   r_eff <- try(loo::relative_eff(exp(ex$log_lik), chain_id = ex$chain_id), silent = TRUE)
   if (inherits(r_eff, "try-error")) r_eff <- NULL
   loo_out <- loo::loo(ex$log_lik, r_eff = r_eff, cores = 1)
@@ -386,7 +319,7 @@ compute_psis_loo <- function(mcmc_list) {
   if (inherits(kvec, "try-error") || is.null(kvec)) kvec <- rep(NA_real_, ncol(ex$log_lik))
   list(
     loo = loo_out,
-    k_max = max(kvec, na.rm = TRUE),
+    k_max = suppressWarnings(max(kvec, na.rm = TRUE)),
     k_frac_gt_05 = mean(kvec > 0.5, na.rm = TRUE),
     k_frac_gt_07 = mean(kvec > 0.7, na.rm = TRUE),
     k_frac_gt_10 = mean(kvec > 1.0, na.rm = TRUE),
@@ -398,59 +331,54 @@ compute_psis_loo <- function(mcmc_list) {
 run_flex <- function(y, XZ, family = c("poisson","gaussian","nbinom"),
                      prior = c("switch","horseshoe"),
                      sampler_strategy = c("auto","slice","rw","ess","nuts"),
-                     include_pairs = TRUE, include_triplets = TRUE,
                      niter=cfg$niter, nburn=cfg$nburn, thin=cfg$thin, nchains=cfg$nchains) {
 
   family <- match.arg(family); prior <- match.arg(prior)
   sampler_strategy <- match.arg(sampler_strategy)
 
   N <- nrow(XZ); P <- ncol(XZ)
-  pr <- build_pairs(P); Q <- if (include_pairs) length(pr$p1) else 0L
-  tr <- build_triplets(P); R <- if (include_triplets) length(tr$t1) else 0L
+  pr <- build_pairs(P); Q <- length(pr$p1)
 
-  code <- code_flex_QRaware(N,P,Q,R,family,prior, include_pairs, include_triplets)
-  consts <- list(N=N, P=P, Q=Q, R=R, eps=1e-6,
-                 j1 = if (Q>1) as.integer(pr$p1) else if (Q==1) as.integer(pr$p1[1]) else integer(0),
-                 j2 = if (Q>1) as.integer(pr$p2) else if (Q==1) as.integer(pr$p2[1]) else integer(0),
-                 k1 = if (R>1) as.integer(tr$t1) else if (R==1) as.integer(tr$t1[1]) else integer(0),
-                 k2 = if (R>1) as.integer(tr$t2) else if (R==1) as.integer(tr$t2[1]) else integer(0),
-                 k3 = if (R>1) as.integer(tr$t3) else if (R==1) as.integer(tr$t3[1]) else integer(0))
+  code <- code_pairs_Qaware(N,P,Q, FAM = switch(family, poisson=1L, gaussian=2L, nbinom=3L), prior=prior)
+
+  # ALWAYS pass j1/j2 as vectors (length Q), even if Q==1; pass integer(0) if Q==0
+consts <- list(
+  N = N, P = P, Q = Q, eps = 1e-6,
+  FAM = switch(family, poisson = 1L, gaussian = 2L, nbinom = 3L),
+  USE_SWITCH = as.integer(prior == "switch"),
+  USE_HS     = as.integer(prior == "horseshoe"),
+  j1 = if (Q > 0) as.integer(pr$p1) else integer(0),
+  j2 = if (Q > 0) as.integer(pr$p2) else integer(0)
+)
   data <- list(y = as.numeric(y), xz = as.matrix(XZ))
 
   init_fun <- function() {
-    ini <- list(alpha = 0, beta = rnorm(P,0,0.5), gamma = runif(P,-0.2,0.2),
-                prec_beta = 1)
+    ini <- list(alpha = 0, beta = rnorm(P,0,0.5), gamma = runif(P,-0.2,0.2), prec_beta = 1)
     if (Q > 0) { ini$psi1 <- runif(Q,-0.2,0.2); ini$psi2 <- runif(Q,-0.2,0.2); ini$kappa <- rnorm(Q,0,0.1) }
-    if (R > 0) { ini$phi1 <- runif(R,-0.2,0.2); ini$phi2 <- runif(R,-0.2,0.2); ini$phi3 <- runif(R,-0.2,0.2); ini$omega <- rnorm(R,0,0.1) }
-    if (prior == "switch") { if (Q>0) { ini$pi2 <- 0.2; ini$zeta2 <- rbinom(Q,1,0.1); ini$prec_kappa2 <- 1 }
-                             if (R>0) { ini$pi3 <- 0.2; ini$zeta3 <- rbinom(R,1,0.05); ini$prec_kappa3 <- 1 } }
-    if (prior == "horseshoe") {
-      ini$tau2_k <- 1; ini$xi_k <- 1; if (Q>0) { ini$lambda2_k <- rep(1,Q); ini$nu_k <- rep(1,Q) }
-      ini$tau2_o <- 1; ini$xi_o <- 1; if (R>0) { ini$lambda2_o <- rep(1,R); ini$nu_o <- rep(1,R) }
-    }
+    if (prior == "switch" && Q>0) { ini$pi2 <- 0.2; ini$zeta2 <- rbinom(Q,1,0.1); ini$prec_kappa2 <- 1 }
+    if (prior == "horseshoe" && Q>0) { ini$tau2_k <- 1; ini$xi_k <- 1; ini$lambda2_k <- rep(1,Q); ini$nu_k <- rep(1,Q) }
     if (family == "gaussian") ini$prec <- 1/var(y)
     if (family == "nbinom")   ini$delta <- 1
     ini
   }
 
-  message("Defining model")
-  model <- nimbleModel(code, constants=consts, data=data, inits=init_fun())
+  cat("Defining model\n")
+  model <- nimbleModel(code, constants=consts, data=data, inits=init_fun(), buildDerivs = TRUE)
 
   monitors <- c("alpha",
                 if (P>0) c(paste0("beta[",1:P,"]"), paste0("gamma[",1:P,"]")) else NULL,
                 if (Q>0) c(paste0("psi1[",1:Q,"]"), paste0("psi2[",1:Q,"]"), paste0("kappa[",1:Q,"]"), "kappa_mag2") else NULL,
-                if (R>0) c(paste0("phi1[",1:R,"]"), paste0("phi2[",1:R,"]"), paste0("phi3[",1:R,"]"), paste0("omega[",1:R,"]"), "omega_mag2") else NULL,
                 paste0("y_rep[",1:N,"]"),
-                paste0("ll[",1:N,"]"),  # pointwise log-likelihood
+                paste0("ll[",1:N,"]"),
                 if (family=="gaussian") "prec" else NULL,
                 if (family=="nbinom")  "delta" else NULL,
                 if (prior=="horseshoe" && Q>0) "tau2_k" else NULL,
-                if (prior=="horseshoe" && R>0) "tau2_o" else NULL,
-                if (prior=="switch" && Q>0)    "pi2"   else NULL,
-                if (prior=="switch" && R>0)    "pi3"   else NULL)
-
+                if (prior=="switch"    && Q>0) "pi2"    else NULL)
+  
   conf <- configureMCMC(model, monitors = monitors)
-  assign_samplers(conf, model, P, Q, R, strategy = sampler_strategy)
+  conf <- assign_samplers(conf, model, P, Q, strategy = sampler_strategy, monitors = monitors)
+
+conf$printSamplers(byType = TRUE)
 
   mcmc   <- buildMCMC(conf)
   cmodel <- compileNimble(model)
@@ -460,12 +388,10 @@ run_flex <- function(y, XZ, family = c("poisson","gaussian","nbinom"),
     samps <- runMCMC(cmcmc, niter=niter, nburnin=nburn, thin=thin, nchains=nchains, samplesAsCodaMCMC=TRUE)
   })
 
-  # PSIS-LOO from pointwise log-lik
   ps <- compute_psis_loo(samps)
-
   S <- as.matrix(do.call(rbind, samps))
   list(samples=samps, Smat=S, time=unname(tm["elapsed"]),
-       family=family, P=P, Q=Q, R=R, prior=prior, strategy=sampler_strategy,
+       family=family, P=P, Q=Q, prior=prior, strategy=sampler_strategy,
        loo=ps$loo, k_max=ps$k_max, k_frac_gt_05=ps$k_frac_gt_05, k_frac_gt_07=ps$k_frac_gt_07, k_frac_gt_10=ps$k_frac_gt_10,
        k_values=ps$k_values)
 }
@@ -492,14 +418,14 @@ tidy_report <- function(name, y, fit) {
     Pareto_k_gt0.5 = fit$k_frac_gt_05,
     Pareto_k_gt0.7 = fit$k_frac_gt_07,
     Pareto_k_gt1.0 = fit$k_frac_gt_10,
-    fam = fit$family, P = fit$P, Q_pairs = fit$Q, R_trip = fit$R
+    fam = fit$family, P = fit$P, Q_pairs = fit$Q
   )
   print(row)
   row
 }
 
 # --------------- full suite per dataset --------------------
-run_suite <- function(name, y, XZ, family, include_pairs=cfg$include_pairs, include_triplets=cfg$include_triplets) {
+run_suite <- function(name, y, XZ, family) {
   # collinearity info (on full XZ)
   collin_path <- file.path(cfg$collin_dir, paste0(tagify(name), ".txt"))
   try(collin_report(name, XZ, collin_path), silent=TRUE)
@@ -508,8 +434,7 @@ run_suite <- function(name, y, XZ, family, include_pairs=cfg$include_pairs, incl
   for (pr in cfg$priors_to_run) {
     for (st in cfg$sampler_strategies) {
       cat(sprintf("\n== %s | prior=%s | sampler=%s ==\n", name, pr, toupper(st)))
-      fit <- run_flex(y, XZ, family=family, prior=pr, sampler_strategy=st,
-                      include_pairs=include_pairs, include_triplets=include_triplets)
+      fit <- run_flex(y, XZ, family=family, prior=pr, sampler_strategy=st)
       # save Pareto-k vector
       pk_path <- file.path(cfg$results_dir, paste0("pareto_k_", tagify(name), "_", pr, "_", toupper(st), ".csv"))
       readr::write_csv(tibble(obs = seq_along(fit$k_values), pareto_k = fit$k_values), pk_path)
@@ -525,7 +450,6 @@ run_suite <- function(name, y, XZ, family, include_pairs=cfg$include_pairs, incl
 }
 
 # ================== DATA PREP ==============================
-# Each item returns: name, y, XZ (scaled), fam
 mk_simulations <- function() {
   # Sim A
   N3 <- 600; X3 <- cbind(rnorm(N3,0.3,1.0), rnorm(N3,-0.4,1.1), rnorm(N3,0.0,1.2))
@@ -558,28 +482,10 @@ mk_simulations <- function() {
     kappa_C[3]*spow(XZ5[,2],1)*spow(XZ5[,3],1)
   y_C <- rpois(N5, exp(eta_C))
 
-  # Sim D (pair+triplet)
-  ND <- 650
-  x1 <- rnorm(ND, 0.2, 1.0); x2 <- rnorm(ND, -0.5, 1.0); x3 <- rnorm(ND, 0.0, 1.0)
-  F  <- factor(sample(c("A","B"), ND, TRUE)); F_sign <- ifelse(F=="A", 1, -1)
-  XZ_D <- cbind(zscore(x1), zscore(x2), zscore(x3), zscore(F_sign))
-  alpha_D <- 0.7; beta_D <- c(0.7,-0.6,0.4, 0.3); gamma_D <- c(1.0,1.5,0.7,1.0)
-  kappa12 <- 0.4
-  omegaF23 <- 0.4; phiF <- 1.0; phi2 <- 0.9; phi3 <- 1.1
-  eta_D <- alpha_D +
-    beta_D[1]*spow(XZ_D[,1], gamma_D[1]) +
-    beta_D[2]*spow(XZ_D[,2], gamma_D[2]) +
-    beta_D[3]*spow(XZ_D[,3], gamma_D[3]) +
-    beta_D[4]*spow(XZ_D[,4], gamma_D[4]) +
-    kappa12  * spow(XZ_D[,1],1) * spow(XZ_D[,2],1) +
-    omegaF23 * spow(XZ_D[,2],phi2) * spow(XZ_D[,3],phi3) * spow(XZ_D[,4],phiF)
-  y_D <- rpois(ND, exp(eta_D))
-
   list(
     list(name="Sim A (Pois, 3, no int)", y=y_A, XZ=unname(XZ3), fam="poisson"),
     list(name="Sim B (Pois, 3, x1:x2)", y=y_B, XZ=unname(XZ3), fam="poisson"),
-    list(name="Sim C (Pois, 5, 3 pairs)", y=y_C, XZ=unname(XZ5), fam="poisson"),
-    list(name="Sim D (Pois, 3+F, pair+trip)", y=y_D, XZ=unname(XZ_D), fam="poisson")
+    list(name="Sim C (Pois, 5, 3 pairs)", y=y_C, XZ=unname(XZ5), fam="poisson")
   )
 }
 
@@ -693,7 +599,6 @@ mk_gbif_worldclim <- function(gbif_csv=cfg$gbif_csv, wc_tif=cfg$wc_tif, topK=cfg
   dat <- bind_rows(pres, zeros) %>% drop_na()
   X <- as.matrix(dat[ , -1, drop=FALSE]); y <- dat$y
 
-  # top-K selection
   sds <- apply(X,2,sd)
   keep_by_var <- names(sort(sds, decreasing = TRUE))[1:min(topK*2, ncol(X))]
   X <- X[, keep_by_var, drop=FALSE]
@@ -713,7 +618,27 @@ all_rows <- list()
 for (d in datasets) {
   if (is.null(d)) next
   message("\n=== DATASET: ", d$name, " | P=", ncol(d$XZ), " ===")
-  res <- run_suite(d$name, d$y, d$XZ, d$fam)
+  # collinearity info
+  collin_path <- file.path(cfg$collin_dir, paste0(tagify(d$name), ".txt"))
+  try(collin_report(d$name, d$XZ, collin_path), silent=TRUE)
+
+  res_list <- list()
+  for (pr in cfg$priors_to_run) {
+    for (st in cfg$sampler_strategies) {
+      cat(sprintf("\n== %s | prior=%s | sampler=%s ==\n", d$name, pr, toupper(st)))
+      fit <- run_flex(d$y, d$XZ, family=d$fam, prior=pr, sampler_strategy=st)
+      # save Pareto-k vector
+      pk_path <- file.path(cfg$results_dir, paste0("pareto_k_", tagify(d$name), "_", pr, "_", toupper(st), ".csv"))
+      readr::write_csv(tibble(obs = seq_along(fit$k_values), pareto_k = fit$k_values), pk_path)
+
+      res_list[[length(res_list)+1]] <- tidy_report(d$name, d$y, fit)
+      if (is.finite(fit$k_max) && fit$k_max > 0.7) {
+        message(sprintf("  [PSIS warning] max Pareto-k=%.3f (>0.7). Consider k-fold later.", fit$k_max))
+      }
+      save_point(sprintf("%s_%s_%s", tagify(d$name), pr, st))
+    }
+  }
+  res <- bind_rows(res_list)
   out_path <- file.path(cfg$results_dir, paste0(tagify(d$name), ".csv"))
   readr::write_csv(res, out_path)
   all_rows[[length(all_rows)+1]] <- res
@@ -724,4 +649,4 @@ if (length(all_rows)) {
 }
 save_point("after_main_runs")
 
-cat("\nDone. Results in '", cfg$results_dir, "'. Frequent checkpoints in flint.Rdata\n", sep="")
+cat("\nDone. Results in '", cfg$results_dir, "'. Frequent checkpoints in flintplus.Rdata\n", sep="")
