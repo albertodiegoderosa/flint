@@ -1,0 +1,201 @@
+\documentclass[11pt]{article}
+
+%---------------------- Packages ----------------------
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[UKenglish]{babel}
+\usepackage{amsmath, amssymb}
+\usepackage{graphicx}
+\usepackage{geometry}
+\usepackage{tikz}
+\usepackage{enumitem}
+\usepackage{lineno}
+\usepackage{setspace}
+\usepackage{hyperref}
+\usepackage[sort]{natbib}
+\usepackage{listings}
+\usepackage{longtable}
+\usepackage{todonotes}
+\usepackage{rotating}
+\usepackage{float}
+\usepackage{appendix}
+\usepackage{relsize}
+\usepackage[table]{xcolor}
+\usepackage{booktabs}
+%\usepackage{draftwatermark}                % in your preamble
+%\SetWatermarkText{CONFIDENTIAL}            % your watermark text
+%\SetWatermarkScale{3}                      % adjust size
+%\SetWatermarkAngle{45}                     % diagonal
+%\SetWatermarkColor[gray]{0.8}   
+%---------------------- Page Layout ----------------------
+\geometry{a4paper, margin=2cm}
+\setlength{\parskip}{1ex plus0.5ex minus0.5ex}
+\setlength{\parindent}{0pt}
+
+%---------------------- Listings Settings ----------------------
+\lstset{
+    basicstyle=\scriptsize\ttfamily,
+    columns=flexible,
+    breaklines=true
+}
+
+%---------------------- Title, Authors, etc. ----------------------
+\begin{document}
+\renewcommand{\thesection}{\arabic{section}}
+\begin{doublespacing}
+\begin{linenumbers}
+\begin{flushleft}
+{\bf \large Flexible Interaction Modelling with Learned Powers: Horseshoe versus Switch Priors and Sampler Choice}\\ 
+\input{authors.tex}
+\newpage
+
+%---------------------- Abstract ----------------------
+\section*{Abstract}
+
+
+
+\section{Introduction}
+
+In many ecological and environmental applications we care about how covariates act together rather than in isolation. For example, a species' occurrence may depend jointly on climate, habitat structure and sampling effort, in ways that are non‐linear and hard to anticipate. Standard generalised linear models can include interaction terms, but specifying these by hand quickly becomes unwieldy as the number of predictors grows, and stepwise procedures tend to be unstable \citep{2015_warton,2009_zurr,2017_zuur}. As a result, many analyses include at most a small number of pre–chosen interactions, even when there is clear scientific interest in how predictors combine.
+
+When the main goal is prediction, tree–based ensemble methods such as gradient boosting and boosted regression trees (BRTs) provide a flexible and effective way to capture complex response surfaces \citep{2001_friedman,2008_elith}. These methods learn non–linear main effects and higher–order interactions with minimal manual specification and are now standard tools in many ecological workflows. Our focus here is more specialised and complementary: we work within a parametric regression framework, aiming to describe interactions through relatively simple functions of covariates, to quantify uncertainty through a fully Bayesian analysis, and to take advantage of the way such models can be embedded in richer hierarchical structures.
+
+The idea we explore is that flexible interactions can be constructed from a small set of transformed covariates with learned shapes. Specifically, we represent both main effects and pairwise interactions through powered transformations of standardised covariates. For each predictor, the model learns a power parameter that controls the shape of its contribution. Products of these transformed predictors then yield a low–rank but flexible representation of interactions. This construction is conceptually related to the way tree ensembles build up complex interactions from simple components, but it remains firmly within a generalised linear modelling framework and keeps parameters directly interpretable.
+
+Once many candidate interaction terms are available, some form of regularisation is essential. A natural and intuitive starting point is to introduce explicit binary ``switches'' for each interaction, leading to a spike–and–slab prior on the corresponding coefficients. This matches the way many practitioners think about model building (an interaction is either ``in'' or ``out''), and we use this switch formulation as a first, more concrete way to introduce the model. At the same time, global–local shrinkage priors such as the horseshoe have proved very effective for sparse regression and interaction selection, with attractive theoretical and practical properties \citep{2010_carvalho,2017_piironen}. Replacing binary switches by a continuous shrinkage prior changes how sparsity is induced and can interact with the choice of sampler, especially in the presence of collinearity and flexible interaction surfaces.
+
+A further layer of uncertainty comes from computation. Modern Bayesian software such as \texttt{nimble} \citep{2017_deValpine} makes it straightforward to implement one model and then swap between different Markov chain Monte Carlo (MCMC) algorithms. In practice, the choice between random–walk Metropolis, slice sampling \citep{2003_neal} and Hamiltonian Monte Carlo with the No–U–Turn sampler (NUTS; \citealp{2014_hoffman}) can have a large impact on effective sample size, mixing and on how clearly interaction patterns emerge from a finite run.
+
+In this paper we bring together these existing ingredients in a single framework and address three linked questions:
+\begin{enumerate}
+  \item can flexible interactions built from powered covariates be fitted and interpreted reliably in data sets of a size and structure typical for ecological applications?
+  \item how do a discrete switch prior and a continuous horseshoe prior behave when used to regulate the same set of candidate interactions, in terms of sparsity patterns and predictive performance?
+  \item how much does the choice of MCMC sampler matter for these models, in terms of computational efficiency and the resulting summaries of interaction structure?
+\end{enumerate}
+
+We study these questions using simulated data sets with known interaction structure and several standard ecological case studies spanning Gaussian, Poisson and negative binomial responses. All models are implemented in \texttt{nimble}, which lets us hold the model definition fixed while varying priors and samplers. For model comparison we use approximate leave–one–out cross–validation based on Pareto–smoothed importance sampling (PSIS–LOO), following \citet{2017_vehtari}. In our setting PSIS–LOO provides stable, well–behaved diagnostics and sufficient resolution to compare models and samplers. Our aim is not to position the proposed model as a replacement for methods such as BRTs, but to document how this particular combination of powered covariates, switch and horseshoe priors, and different MCMC algorithms behaves in settings where a regression–type description of interactions and full Bayesian uncertainty quantification are of interest.
+
+\section{Methods}
+
+\subsection{Data and likelihood}
+
+Let $y_i$ denote the response for observation $i = 1,\dots,n$, and let
+\[
+  \mathbf{x}_i = (x_{i1},\dots,x_{iP})^\top
+\]
+be the corresponding vector of covariates. Each covariate is centred and scaled,
+\[
+  x_{ij}^{\ast} = \frac{x_{ij} - \bar{x}_j}{s_j},
+\]
+and we write $x_{ij}$ for these standardised values in what follows.
+
+We use a generalised linear model with linear predictor $\eta_i$ and link function $g$. For each observation,
+\[
+  y_i \mid \eta_i,\phi \sim p\bigl(y_i \mid \eta_i,\phi\bigr),
+\]
+where $p(\cdot)$ is an exponential family density and $\phi$ is a dispersion or scale parameter. In our examples we consider:
+\begin{itemize}
+  \item Gaussian responses: $y_i \sim \mathcal{N}(\eta_i,\sigma^2)$ with identity link;
+  \item Poisson counts: $y_i \sim \mathrm{Poisson}(\mu_i)$ with $\log \mu_i = \eta_i$;
+  \item Negative binomial counts: $y_i \sim \mathrm{NB}(\mu_i,r)$ with $\log \mu_i = \eta_i$, where $r$ is an overdispersion parameter.
+\end{itemize}
+For count data we optionally include a log–offset $\log E_i$ for known variation in exposure or effort, by replacing $\eta_i$ with $\eta_i + \log E_i$.
+
+\subsection{Flexible main effects and interactions via learned powers}
+
+Our main modelling device is a simple powered transformation applied to each standardised covariate. For predictor $j$ we define
+\begin{equation}
+  f_j(x_{ij}) = \mathrm{sign}(x_{ij})\bigl(|x_{ij}| + \epsilon\bigr)^{\psi_j},
+  \label{eq:power-transform}
+\end{equation}
+where $\psi_j > 0$ is a parameter to be learned from the data and $\epsilon>0$ is a small constant (e.g. $\epsilon = 10^{-6}$) introduced for numerical stability near zero. When $\psi_j = 1$ this reduces to a standardised linear effect; values $\psi_j < 1$ compress large values and can approximate saturating responses, while $\psi_j > 1$ emphasise extremes.
+
+We then construct the linear predictor as
+\begin{equation}
+  \eta_i
+  =
+  \alpha
+  + \sum_{j=1}^P \beta_j f_j(x_{ij})
+  + \sum_{1 \le j < k \le P} \kappa_{jk} f_j(x_{ij}) f_k(x_{ik}),
+  \label{eq:eta}
+\end{equation}
+where $\alpha$ is an intercept, $\beta_j$ are main–effect coefficients and $\kappa_{jk}$ are interaction coefficients. This parameterisation has three advantages for our purposes:
+
+\begin{enumerate}
+  \item The same power parameters $\psi_j$ control both the shape of main effects and the way each covariate enters interactions, tying the structure together.
+  \item Pairwise interactions are represented by products of smooth functions, which can approximate a wide range of bivariate response surfaces without introducing many additional parameters.
+  \item The model remains a regression in transformed covariates, so standard tools for interpretation (partial dependence plots, posterior summaries of coefficients, etc.) remain available.
+\end{enumerate}
+
+Higher–order interactions could be added by including products of three or more transformed covariates, but here we restrict attention to two–way interactions to keep the focus on the comparison between priors and samplers.
+
+\subsection{Priors for main effects and power parameters}
+
+We place a weakly informative Gaussian prior on the intercept,
+\[
+  \alpha \sim \mathcal{N}(0,\sigma_\alpha^2),
+\]
+with $\sigma_\alpha$ large enough to cover plausible values on the link scale (e.g. $\sigma_\alpha = 5$ for log– or logit–links after centring the response).
+
+For the main–effect coefficients we use a hierarchical Gaussian prior,
+\begin{align*}
+  \beta_j \mid \sigma_\beta^2 &\sim \mathcal{N}(0,\sigma_\beta^2), \quad j=1,\dots,P, \\
+  \sigma_\beta &\sim \mathrm{Half\text{-}Cauchy}(0,s_\beta),
+\end{align*}
+with scale $s_\beta$ chosen to be weakly informative \citep{2014_gelman}. This allows the data to determine the overall magnitude of main effects while shrinking weak predictors towards zero.
+
+To keep $\psi_j$ positive and within a moderate range we work on the log–scale,
+\[
+  \log \psi_j \sim \mathcal{N}(\mu_\psi,\sigma_\psi^2), \quad j=1,\dots,P,
+\]
+with $\mu_\psi$ and $\sigma_\psi$ chosen so that most prior mass lies on, for example, $\psi_j \in [0.25,4]$. Because covariates are standardised, these ranges remain interpretable and help avoid identifiability problems between $\psi_j$ and $\beta_j$.
+
+\subsection{Horseshoe prior for interactions}
+
+In the horseshoe version of the model we treat all pairwise interactions as potentially active, but use a global–local shrinkage prior to encourage sparsity. Following \citet{2010_carvalho,2017_piironen}, we write
+\begin{align}
+  \kappa_{jk} \mid \lambda_{jk},\tau &\sim \mathcal{N}\bigl(0,\tau^2 \lambda_{jk}^2\bigr),
+  \quad 1 \le j < k \le P,
+  \label{eq:hs-kappa} \\
+  \lambda_{jk} &\sim \mathcal{C}^+(0,1), \\
+  \tau &\sim \mathcal{C}^+(0,s_\tau),
+\end{align}
+where $\mathcal{C}^+$ denotes the half–Cauchy distribution. The local scales $\lambda_{jk}$ let a small number of interaction coefficients escape strong shrinkage, while the global scale $\tau$ controls the overall sparsity level. We choose $s_\tau$ using the heuristic in \citet{2017_piironen}, which links it to a weakly informative prior on the number of effectively non–zero interactions.
+
+This prior places substantial mass near zero but retains heavy tails, which helps prevent over–shrinkage of large, well–identified interaction effects. It preserves a fully continuous parameterisation, which can be advantageous for gradient–based samplers such as Hamiltonian Monte Carlo.
+
+\subsection{Binary switch prior for interactions}
+
+In the switch version we introduce an explicit binary inclusion indicator for each candidate interaction. For $1 \le j < k \le P$ we define
+\begin{align}
+  z_{jk} &\sim \mathrm{Bernoulli}(\pi), \\
+  \kappa_{jk} \mid z_{jk} &\sim (1-z_{jk})\,\delta_0 + z_{jk}\,\mathcal{N}(0,\sigma_\kappa^2),
+\end{align}
+where $\delta_0$ is a point mass at zero. The inclusion probability $\pi$ and slab scale $\sigma_\kappa$ have hyperpriors
+\begin{align}
+  \pi &\sim \mathrm{Beta}(a_\pi,b_\pi), \\
+  \sigma_\kappa &\sim \mathrm{Half\text{-}Cauchy}(0,s_\kappa).
+\end{align}
+In our experiments we choose $a_\pi$ and $b_\pi$ so that the prior mean of $\pi$ corresponds to a small proportion of active interactions (for example, $\mathbb{E}[\pi] = 0.1$), reflecting the belief that only a minority of possible interactions are substantively important.
+
+This spike–and–slab–type prior usually produces more exact zeros than the horseshoe. It also aligns closely with the intuitive notion of ``switching on'' a small set of interactions. In the fitted model we summarise posterior inclusion probabilities $\Pr(z_{jk}=1 \mid \text{data})$ alongside the estimated interaction surfaces, and compare these to the continuous shrinkage patterns produced by the horseshoe.
+
+\subsection{Posterior computation and model comparison}
+
+All models are implemented in \texttt{nimble} \citep{2017_deValpine}, which compiles model code to \texttt{C++} and provides a flexible system for specifying samplers. For each data set and prior choice (horseshoe or switch) we run multiple MCMC chains under several sampler configurations.
+
+In a baseline configuration we use random–walk Metropolis updates for regression coefficients and power parameters, combined with Gibbs or adaptive Metropolis–within–Gibbs steps for variance and dispersion parameters. For the horseshoe model we sample the interaction coefficients $\kappa_{jk}$ and their local scales $\lambda_{jk}$ using either joint or alternating random–walk updates. For the switch model we update $(z_{jk},\kappa_{jk})$ in blocks, so that inclusion decisions and coefficient values are adapted together.
+
+To study the impact of the sampler we then replace some of these random–walk updates with slice sampling \citep{2003_neal} or with Hamiltonian Monte Carlo using the No–U–Turn sampler \citep{2014_hoffman}, where these are available in \texttt{nimble}. Using a single model specification and data pre–processing across all runs makes it straightforward to compare effective sample sizes, convergence diagnostics and posterior summaries across priors and samplers.
+
+We monitor convergence using trace plots, potential scale–reduction factors $\widehat{R}$, effective sample sizes and Heidelberger–Welch tests for stationarity \citep{1983_heidelberger,2014_gelman}. Posterior predictive checks are carried out by simulating replicated data $y_i^{\mathrm{rep}}$ from the fitted model and comparing test statistics between observed and replicated data.
+
+For model comparison we rely on approximate leave–one–out predictive performance computed via Pareto–smoothed importance sampling (PSIS–LOO) \citep{2017_vehtari}. In practice we work with the estimated expected log predictive density and corresponding standard errors, and inspect the Pareto shape parameters to check the reliability of the importance sampling approximation. In the data sets we consider, these diagnostics are well behaved, so PSIS–LOO provides a practical and statistically sound basis for comparing the horseshoe and switch priors and for assessing the impact of different MCMC samplers.
+
+\bibliographystyle{plainnat}
+\bibliography{flint}
+
+\end{flushleft}
+\end{linenumbers}
+\end{doublespacing}
+\end{document}
